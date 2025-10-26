@@ -37,7 +37,7 @@ where Base: Sendable, Base.Element: Sendable, Transformed: Sendable, Transformed
   public struct Iterator: AsyncIteratorProtocol {
     private let storage: Storage<Base, Transformed>
     private var channelIterator: AsyncThrowingChannel<Transformed.Element, Error>.Iterator
-    private let task: Task<Void, Never>
+    private let mainTask: Task<Void, Never>
 
     init(
       base: Base,
@@ -46,14 +46,14 @@ where Base: Sendable, Base.Element: Sendable, Transformed: Sendable, Transformed
       let storage = Storage(base: base, transform: transform)
       self.storage = storage
       self.channelIterator = storage.channel.makeAsyncIterator()
-      self.task = Task { await storage.run() }
+      self.mainTask = Task { await storage.run() }
     }
 
     public mutating func next() async throws -> Element? {
       try await withTaskCancellationHandler {
         try await channelIterator.next()
-      } onCancel: { [task] in
-        task.cancel()
+      } onCancel: { [mainTask] in
+        mainTask.cancel()
       }
     }
   }
