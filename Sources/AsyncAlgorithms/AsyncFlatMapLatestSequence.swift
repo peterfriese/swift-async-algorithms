@@ -30,14 +30,13 @@ extension AsyncSequence {
 }
 
 @available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, *)
-@available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, *)
 public struct AsyncFlatMapLatestSequence<Base: AsyncSequence, Transformed: AsyncSequence>: AsyncSequence
 where Base: Sendable, Base.Element: Sendable, Transformed: Sendable, Transformed.Element: Sendable {
   public typealias Element = Transformed.Element
-  
+
   let base: Base
   let transform: @Sendable (Base.Element) async -> Transformed
-  
+
   init(
     _ base: Base,
     transform: @Sendable @escaping (Base.Element) async -> Transformed
@@ -45,10 +44,11 @@ where Base: Sendable, Base.Element: Sendable, Transformed: Sendable, Transformed
     self.base = base
     self.transform = transform
   }
-  
+
   public struct Iterator: AsyncIteratorProtocol {
     private let coordinator: Coordinator<Base, Transformed>
     private var channelIterator: AsyncThrowingChannel<Transformed.Element, Error>.Iterator
+    private var started = false
 
     init(
       base: Base,
@@ -57,11 +57,14 @@ where Base: Sendable, Base.Element: Sendable, Transformed: Sendable, Transformed
       let coordinator = Coordinator(base: base, transform: transform)
       self.coordinator = coordinator
       self.channelIterator = coordinator.channel.makeAsyncIterator()
-      Task { await coordinator.start() }
     }
-    
+
     public mutating func next() async throws -> Element? {
       let coordinator = self.coordinator
+      if !started {
+        started = true
+        Task { await coordinator.start() }
+      }
       return try await withTaskCancellationHandler {
         try await channelIterator.next()
       } onCancel: {
@@ -69,14 +72,14 @@ where Base: Sendable, Base.Element: Sendable, Transformed: Sendable, Transformed
       }
     }
   }
-  
+
   public func makeAsyncIterator() -> Iterator {
     Iterator(base: base, transform: transform)
   }
 }
 
 @available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, *)
-extension AsyncFlatMapLatestSequence: Sendable { }
+extension AsyncFlatMapLatestSequence: Sendable {}
 
 @available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, *)
 private actor Coordinator<Base: AsyncSequence, Transformed: AsyncSequence>
@@ -90,7 +93,6 @@ private actor Coordinator<Base: AsyncSequence, Transformed: AsyncSequence>
   private let transform: @Sendable (Base.Element) async -> Transformed
   let channel: AsyncThrowingChannel<Transformed.Element, Error>
 
-  private var outerTask: Task<Void, Never>?
   private var innerTask: Task<Void, Never>?
 
   init(
@@ -102,45 +104,41 @@ private actor Coordinator<Base: AsyncSequence, Transformed: AsyncSequence>
     self.channel = AsyncThrowingChannel<Transformed.Element, Error>()
   }
 
-  func start() {
-      guard outerTask == nil else { return }
+  func start() async {
+    do {
+      var baseIterator = base.makeAsyncIterator()
+      while let element = try await baseIterator.next() {
+        if Task.isCancelled { break }
+        
+        innerTask?.cancel()
+        await Task.yield()
 
-      outerTask = Task {
-        var baseIterator = base.makeAsyncIterator()
-        do {
-          while let element = try await baseIterator.next() {
-            if Task.isCancelled { break }
-            
-            innerTask?.cancel()
-
-            let innerSequence = await transform(element)
-            
-            let newInnerTask = Task {
-              do {
-                var innerIterator = innerSequence.makeAsyncIterator()
-                while let innerElement = try await innerIterator.next() {
-                  if Task.isCancelled { break }
-                  await channel.send(innerElement)
-                }
-              } catch {
-                if !(error is CancellationError) {
-                  channel.fail(error)
-                }
-              }
+        let innerSequence = await transform(element)
+        
+        let newInnerTask = Task {
+          do {
+            var innerIterator = innerSequence.makeAsyncIterator()
+            while let innerElement = try await innerIterator.next() {
+              if Task.isCancelled { break }
+              await channel.send(innerElement)
             }
-            innerTask = newInnerTask
+          } catch {
+            if !(error is CancellationError) {
+              channel.fail(error)
+            }
           }
-          
-          await innerTask?.value
-          channel.finish()
-        } catch {
-          channel.fail(error)
         }
+        innerTask = newInnerTask
       }
+      
+      await innerTask?.value
+      channel.finish()
+    } catch {
+      channel.fail(error)
+    }
   }
 
   func cancel() {
-    outerTask?.cancel()
     innerTask?.cancel()
     channel.finish()
   }

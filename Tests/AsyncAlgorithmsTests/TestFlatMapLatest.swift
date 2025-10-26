@@ -154,4 +154,182 @@ final class TestFlatMapLatest: XCTestCase {
     
     await fulfillment(of: [expectation], timeout: 1)
   }
+
+  private actor ResultCollector {
+    var results = [String]()
+    func append(_ value: String) {
+      results.append(value)
+    }
+  }
+
+  func test_basic_asyncChannels() async throws {
+    let outer = AsyncChannel<Int>()
+    let inner = AsyncChannel<String>()
+    let collector = ResultCollector()
+
+    let sequence = outer.flatMapLatest { _ in inner }
+
+    let task = Task {
+      for try await value in sequence {
+        await collector.append(value)
+      }
+    }
+
+    await outer.send(1)
+    await inner.send("A")
+    await inner.send("B")
+    await inner.send("C")
+    
+    outer.finish()
+    inner.finish()
+
+    try await task.value
+
+    let finalResults = await collector.results
+    XCTAssertEqual(finalResults, ["A", "B", "C"])
+  }
+
+  @available(iOS 16.0, *)
+  func test_switching_asyncChannels() async throws {
+    let outer = AsyncChannel<Int>()
+    let inner1 = AsyncChannel<String>()
+    let inner2 = AsyncChannel<String>()
+    
+    let collector = ResultCollector()
+
+    let sequence = outer.flatMapLatest { value -> AsyncChannel<String> in
+      if value == 1 {
+        return inner1
+      } else {
+        return inner2
+      }
+    }
+
+    let task = Task {
+      for try await value in sequence {
+        await collector.append(value)
+      }
+    }
+
+    // Start with the first inner sequence
+    await outer.send(1)
+    await inner1.send("A")
+    await inner1.send("B")
+    await Task.yield()
+
+    // Switch to the second inner sequence
+    await outer.send(2)
+    await inner2.send("C")
+    await Task.yield()
+
+    // This value should be ignored. We send it in a detached task
+    // because we expect it to hang, and we don't want to block the test.
+    let hangingSend = Task {
+        await inner1.send("D")
+    }
+    // Give it a moment to see if it completes (it shouldn't)
+    try await Task.sleep(for: .milliseconds(100))
+    
+
+    await inner2.send("E")
+    await Task.yield()
+
+    // Finish all channels to allow the sequence to terminate
+    hangingSend.cancel()
+    inner1.finish()
+    inner2.finish()
+    outer.finish()
+
+    // Wait for the iteration task to complete
+    try await task.value
+
+    let finalResults = await collector.results
+    XCTAssertEqual(finalResults, ["A", "B", "C", "E"])
+  }
+
+  func test_completion_asyncChannels() async throws {
+    let outer = AsyncChannel<Int>()
+    let inner = AsyncChannel<String>()
+    let collector = ResultCollector()
+
+    let sequence = outer.flatMapLatest { _ in inner }
+
+    let task = Task {
+      for try await value in sequence {
+        await collector.append(value)
+      }
+    }
+
+    await outer.send(1)
+    outer.finish() // Finish outer sequence early
+
+    await inner.send("A")
+    await inner.send("B")
+    inner.finish()
+
+    try await task.value
+
+    let finalResults = await collector.results
+    XCTAssertEqual(finalResults, ["A", "B"])
+  }
+
+  func test_inner_failure_asyncChannels() async throws {
+    let outer = AsyncChannel<Int>()
+    let inner = AsyncThrowingChannel<String, Error>()
+    let collector = ResultCollector()
+    
+    struct TestError: Error {}
+
+    let sequence = outer.flatMapLatest { _ in inner }
+
+    let task = Task {
+      do {
+        for try await value in sequence {
+          await collector.append(value)
+        }
+        XCTFail("The sequence should have thrown an error.")
+      } catch {
+        XCTAssert(error is TestError)
+      }
+    }
+
+    await outer.send(1)
+    await inner.send("A")
+    inner.fail(TestError())
+
+    await task.value
+    
+    let finalResults = await collector.results
+    XCTAssertEqual(finalResults, ["A"])
+  }
+
+  func test_outer_failure_asyncChannels() async throws {
+    let outer = AsyncThrowingChannel<Int, Error>()
+    let inner = AsyncChannel<String>()
+    let collector = ResultCollector()
+    
+    struct TestError: Error {}
+
+    let sequence = outer.flatMapLatest { _ in inner }
+
+    let task = Task {
+      do {
+        for try await value in sequence {
+          await collector.append(value)
+        }
+        XCTFail("The sequence should have thrown an error.")
+      } catch {
+        XCTAssert(error is TestError)
+      }
+    }
+
+    await outer.send(1)
+    await inner.send("A")
+    outer.fail(TestError())
+
+    await task.value
+    
+    let finalResults = await collector.results
+    XCTAssertEqual(finalResults, ["A"])
+  }
 }
