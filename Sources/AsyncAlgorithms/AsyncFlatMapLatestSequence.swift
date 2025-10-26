@@ -11,6 +11,20 @@
 
 @available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, *)
 extension AsyncSequence {
+  /// Transforms elements into new asynchronous sequences, emitting elements
+  /// from the most recent inner sequence.
+  ///
+  /// When a new element is emitted by this sequence (the "outer" sequence),
+  /// the `transform` is called to produce a new "inner" sequence. Iteration on the
+  /// previous inner sequence is cancelled, and iteration begins on the new one.
+  ///
+  /// This is particularly useful in scenarios where work should be superseded by
+  /// newer, more relevant work, such as responding to user input in a search field.
+  ///
+  /// - Parameter transform: A closure that takes an element of this sequence and
+  ///   returns a new asynchronous sequence.
+  /// - Returns: An asynchronous sequence that emits elements from the latest
+  ///   inner sequence.
   public func flatMapLatest<T: AsyncSequence>(
     _ transform: @Sendable @escaping (Element) async -> T
   ) -> AsyncFlatMapLatestSequence<Self, T> {
@@ -19,6 +33,8 @@ extension AsyncSequence {
 }
 
 @available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, *)
+/// An asynchronous sequence that transforms elements into new asynchronous sequences
+/// and emits elements from the most recent one.
 public struct AsyncFlatMapLatestSequence<Base: AsyncSequence, Transformed: AsyncSequence>: AsyncSequence
 where Base: Sendable, Base.Element: Sendable, Transformed: Sendable, Transformed.Element: Sendable {
   public typealias Element = Transformed.Element

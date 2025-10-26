@@ -24,6 +24,7 @@ This package has three main goals:
 - <doc:Compacted>
 - <doc:Debounce>
 - <doc:Effects>
+- <doc:FlatMapLatest>
 - <doc:Intersperse>
 - <doc:Joined>
 - <doc:Lazy>
