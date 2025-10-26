@@ -11,17 +11,6 @@
 
 @available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, *)
 extension AsyncSequence {
-  /// Transforms elements into new asynchronous sequences, emitting elements
-  /// from the most recent inner sequence.
-  ///
-  /// When a new element is emitted by this sequence (the "outer" sequence),
-  /// the `transform` is called to produce a new "inner" sequence. Iteration on the
-  /// previous inner sequence is cancelled, and iteration begins on the new one.
-  ///
-  /// - Parameter transform: A closure that takes an element of this sequence and
-  ///   returns a new asynchronous sequence.
-  /// - Returns: An asynchronous sequence that emits elements from the latest
-  ///   inner sequence.
   public func flatMapLatest<T: AsyncSequence>(
     _ transform: @Sendable @escaping (Element) async -> T
   ) -> AsyncFlatMapLatestSequence<Self, T> {
@@ -46,29 +35,25 @@ where Base: Sendable, Base.Element: Sendable, Transformed: Sendable, Transformed
   }
 
   public struct Iterator: AsyncIteratorProtocol {
-    private let coordinator: Coordinator<Base, Transformed>
+    private let storage: Storage<Base, Transformed>
     private var channelIterator: AsyncThrowingChannel<Transformed.Element, Error>.Iterator
-    private var started = false
+    private let task: Task<Void, Never>
 
     init(
       base: Base,
       transform: @Sendable @escaping (Base.Element) async -> Transformed
     ) {
-      let coordinator = Coordinator(base: base, transform: transform)
-      self.coordinator = coordinator
-      self.channelIterator = coordinator.channel.makeAsyncIterator()
+      let storage = Storage(base: base, transform: transform)
+      self.storage = storage
+      self.channelIterator = storage.channel.makeAsyncIterator()
+      self.task = Task { await storage.run() }
     }
 
     public mutating func next() async throws -> Element? {
-      let coordinator = self.coordinator
-      if !started {
-        started = true
-        Task { await coordinator.start() }
-      }
-      return try await withTaskCancellationHandler {
+      try await withTaskCancellationHandler {
         try await channelIterator.next()
-      } onCancel: {
-        Task { await coordinator.cancel() }
+      } onCancel: { [task] in
+        task.cancel()
       }
     }
   }
@@ -82,18 +67,20 @@ where Base: Sendable, Base.Element: Sendable, Transformed: Sendable, Transformed
 extension AsyncFlatMapLatestSequence: Sendable {}
 
 @available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, *)
-private actor Coordinator<Base: AsyncSequence, Transformed: AsyncSequence>
-  where
-    Base: Sendable,
-    Base.Element: Sendable,
-    Transformed: Sendable,
-    Transformed.Element: Sendable
-{
-  private let base: Base
+private final class Storage<Base: AsyncSequence, Transformed: AsyncSequence>: Sendable
+where Base: Sendable, Base.Element: Sendable, Transformed: Sendable, Transformed.Element: Sendable {
+  fileprivate let channel = AsyncThrowingChannel<Transformed.Element, Error>()
   private let transform: @Sendable (Base.Element) async -> Transformed
-  let channel: AsyncThrowingChannel<Transformed.Element, Error>
+  private let base: Base
+  
+  private let state = ManagedCriticalState(State.initial)
 
-  private var innerTask: Task<Void, Never>?
+  private struct State {
+    var innerTask: Task<Void, Never>?
+    static var initial: State {
+      State(innerTask: nil)
+    }
+  }
 
   init(
     base: Base,
@@ -101,17 +88,20 @@ private actor Coordinator<Base: AsyncSequence, Transformed: AsyncSequence>
   ) {
     self.base = base
     self.transform = transform
-    self.channel = AsyncThrowingChannel<Transformed.Element, Error>()
   }
 
-  func start() async {
+  func run() async {
     do {
       var baseIterator = base.makeAsyncIterator()
       while let element = try await baseIterator.next() {
         if Task.isCancelled { break }
         
-        innerTask?.cancel()
-        await Task.yield()
+        let oldInnerTask = state.withCriticalRegion { state -> Task<Void, Never>? in
+          let task = state.innerTask
+          state.innerTask = nil
+          return task
+        }
+        oldInnerTask?.cancel()
 
         let innerSequence = await transform(element)
         
@@ -128,18 +118,20 @@ private actor Coordinator<Base: AsyncSequence, Transformed: AsyncSequence>
             }
           }
         }
-        innerTask = newInnerTask
+        state.withCriticalRegion { state in
+          state.innerTask = newInnerTask
+        }
       }
       
-      await innerTask?.value
+      let finalInnerTask = state.withCriticalRegion { state -> Task<Void, Never>? in
+        let task = state.innerTask
+        state.innerTask = nil
+        return task
+      }
+      await finalInnerTask?.value
       channel.finish()
     } catch {
       channel.fail(error)
     }
-  }
-
-  func cancel() {
-    innerTask?.cancel()
-    channel.finish()
   }
 }
